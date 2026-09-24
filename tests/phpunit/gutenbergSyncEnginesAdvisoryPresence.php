@@ -313,7 +313,6 @@ class Tests_Collaboration_GutenbergSyncEnginesAdvisoryPresence extends WP_UnitTe
 			$answer['signals']
 		);
 
-		// Delivered once.
 		$this->assertSame( array(), $this->beat( 'tok-b' )['signals'] );
 	}
 
@@ -384,6 +383,134 @@ class Tests_Collaboration_GutenbergSyncEnginesAdvisoryPresence extends WP_UnitTe
 
 		$this->assertArrayNotHasKey( $room, Fake_Presence_API::$rows );
 		$this->assertSame( array( 'tok-a' ), array_keys( get_transient( Gutenberg_Sync_Engines_Advisory_Presence::TOKENS_TRANSIENT_PREFIX . md5( $room ) ) ) );
+	}
+
+	public function test_with_the_presence_api_each_message_is_its_own_row_and_nothing_lands_in_options() {
+		global $wpdb;
+
+		Fake_Presence_API::$enabled = true;
+		$room                       = $this->room();
+
+		$this->beat( 'tok-a' );
+		wp_set_current_user( self::$other_editor_id );
+		$this->beat( 'tok-b' );
+		wp_set_current_user( self::$editor_id );
+		$this->beat(
+			'tok-a',
+			array(
+				'signals' => array(
+					array(
+						'id'   => 's1',
+						'to'   => 'tok-b',
+						'kind' => 'offer',
+						'data' => 'sdp-offer',
+					),
+					array(
+						'id'   => 's2',
+						'to'   => 'tok-b',
+						'kind' => 'ice',
+						'data' => 'candidate',
+					),
+				),
+			)
+		);
+
+		$mail = array_values(
+			array_filter(
+				array_keys( Fake_Presence_API::$rows[ $room ] ),
+				static function ( $client_id ) {
+					return str_starts_with( $client_id, WP_Sync_Presence_API_Mailbox_Backend::CLIENT_PREFIX );
+				}
+			)
+		);
+		$this->assertCount( 2, $mail );
+		$this->assertSame( self::$editor_id, Fake_Presence_API::$rows[ $room ][ $mail[0] ]['user_id'] );
+
+		// No transient or options row.
+		$this->assertSame( '0', $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s", '%' . $wpdb->esc_like( 'gse_adv_' ) . '%' ) ) );
+
+		$awareness = new WP_Sync_Awareness( new WP_Sync_Post_Meta_Storage() );
+		$this->assertSame( array(), $awareness->entries( $room, 30 ) );
+
+		wp_set_current_user( self::$other_editor_id );
+		$answer = $this->beat( 'tok-b' );
+		$this->assertSame( array( 'tok-a' ), array_column( $answer['peers'], 'token' ) );
+		$this->assertSame( array( 's1', 's2' ), array_column( $answer['signals'], 'id' ) );
+		$this->assertSame( array( 'tok-a', 'tok-a' ), array_column( $answer['signals'], 'from' ) );
+		$this->assertSame( array( 'sdp-offer', 'candidate' ), array_column( $answer['signals'], 'data' ) );
+		$this->assertSame( array( 'gsetab-tok-a', 'gsetab-tok-b' ), array_keys( Fake_Presence_API::$rows[ $room ] ) );
+
+		$this->assertSame( array(), $this->beat( 'tok-b' )['signals'] );
+
+		// Leaving drops mail still waiting for the tab.
+		wp_set_current_user( self::$editor_id );
+		$this->beat(
+			'tok-a',
+			array(
+				'signals' => array(
+					array(
+						'to'   => 'tok-b',
+						'kind' => 'bye',
+						'data' => 'x',
+					),
+				),
+			)
+		);
+		$request = new WP_REST_Request( 'POST', '/gutenberg-sync-engines/v1/advisory/leave' );
+		$request->set_param( 'room', $room );
+		$request->set_param( 'token', 'tok-b' );
+		$this->presence->handle_leave( $request );
+		$this->assertSame( array( 'gsetab-tok-a' ), array_keys( Fake_Presence_API::$rows[ $room ] ) );
+	}
+
+	public function test_with_the_presence_api_a_take_returns_the_newest_messages_up_to_the_cap() {
+		Fake_Presence_API::$enabled = true;
+		$room                       = $this->room();
+		$backend                    = new WP_Sync_Presence_API_Mailbox_Backend();
+		$messages                   = array();
+		for ( $i = 0; $i < Gutenberg_Sync_Engines_Advisory_Presence::MAX_MAILBOX_ENTRIES + 5; $i++ ) {
+			$messages[] = array(
+				'id'   => 'm' . $i,
+				'from' => 'tok-a',
+				'kind' => 'ice',
+				'data' => 'c',
+			);
+		}
+		$backend->send( $room, 'tok-b', $messages, self::$editor_id, 90 );
+
+		$this->beat( 'tok-a' );
+		wp_set_current_user( self::$other_editor_id );
+		$ids = array_column( $this->beat( 'tok-b' )['signals'], 'id' );
+
+		$this->assertCount( Gutenberg_Sync_Engines_Advisory_Presence::MAX_MAILBOX_ENTRIES, $ids );
+		$this->assertSame( 'm5', $ids[0] );
+		$this->assertSame( array(), preg_grep( '/^gsemail-/', array_keys( Fake_Presence_API::$rows[ $room ] ) ) );
+	}
+
+	public function test_without_the_filter_mail_stays_in_options_rows() {
+		global $wpdb;
+
+		Fake_Presence_API::$enabled = true;
+		remove_all_filters( 'wp_sync_mailbox_backend' );
+		$room = $this->room();
+
+		$this->beat( 'tok-a' );
+		wp_set_current_user( self::$other_editor_id );
+		$this->beat(
+			'tok-b',
+			array(
+				'signals' => array(
+					array(
+						'to'   => 'tok-a',
+						'kind' => 'offer',
+						'data' => 'o',
+					),
+				),
+			)
+		);
+
+		$this->assertSame( array( 'gsetab-tok-a', 'gsetab-tok-b' ), array_keys( Fake_Presence_API::$rows[ $room ] ) );
+		$this->assertSame( '1', $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s", $wpdb->esc_like( Gutenberg_Sync_Engines_Advisory_Presence::MAILBOX_OPTION_PREFIX . md5( $room ) ) . '%' ) ) );
 	}
 
 	public function test_company_is_also_seen_through_live_sync_awareness() {
